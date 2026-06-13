@@ -113,6 +113,26 @@ def webhook():
 @app.route('/', methods=['GET'])
 def index():
     return jsonify({'status': 'VK-ListOk integration is running!'}), 200
+@app.route('/webhook/wappi', methods=['POST'])
+def wappi_webhook():
+    data = request.json
+    print("📱 Wappi webhook:", data)
+    body = data.get('body', {})
+    if body.get('typeMessage') != 'textMessage': 
+        return '', 200
+    
+    phone = body.get('senderId', '').split('@')[0]
+    text = body.get('textMessageData', {}).get('textMessage', '')
+    sender_name = body.get('senderName', '')
+    
+    if not phone or phone == '0': 
+        return '', 200
+
+    contact_id = find_or_create_contact(f"+{phone}", sender_name)
+    if contact_id:
+        create_inquiry(contact_id, f"WhatsApp: {text}")
+    
+    return '', 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
