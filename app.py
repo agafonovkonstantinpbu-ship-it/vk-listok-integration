@@ -1,216 +1,200 @@
 import os
 import re
 import requests
-from flask import Flask, request, jsonify
-from dotenv import load_dotenv
+import json
+from flask import Flask, request, jsonify, redirect, url_for
+from dotenv import load_dotenv, set_key
 
+# Загружаем .env
 load_dotenv()
 
 app = Flask(__name__)
 
-# Конфигурация ListOk CRM
-LISTOK_URL = os.getenv('LISTOK_BASE_URL', 'https://an10569.listokcrm.ru').rstrip('/')
-API_TOKEN = os.getenv('LISTOK_API_TOKEN')
-CFORM_ID = os.getenv('CFORM_ID', '1')
+# --- КОНФИГУРАЦИЯ ---
+LISTOK_BASE_URL = os.getenv('LISTOK_BASE_URL', '').rstrip('/')
+CLIENT_ID = os.getenv('CLIENT_ID')
+CLIENT_SECRET = os.getenv('CLIENT_SECRET')
+REDIRECT_URI = os.getenv('REDIRECT_URI')
 
-HEADERS = {
-    'Authorization': f'Bearer {API_TOKEN}',
-    'Content-Type': 'application/json',
-    'X-Requested-With': 'XMLHttpRequest'
-}
+# Токен (изначально пустой, загружается из env)
+ACCESS_TOKEN = os.getenv('LISTOK_ACCESS_TOKEN')
 
-def normalize_phone(phone):
-    """Нормализация телефона"""
-    if not phone:
-        return ''
-    digits = re.sub(r'\D', '', phone)
-    if digits.startswith('8') and len(digits) == 11:
-        digits = '7' + digits[1:]
-    if len(digits) == 11 and not digits.startswith('7'):
-        digits = '7' + digits
-    return f"+{digits}" if not digits.startswith('+') else digits
-
-def find_or_create_contact(phone, name="", email=""):
-    """Ищем или создаём контакт в ListOk"""
-    print(f"🔍 Поиск контакта: {phone}")
+def get_headers():
+    """Возвращает заголовки с токеном"""
+    global ACCESS_TOKEN
+    # Если токен в переменной пуст, пробуем обновить из env
+    if not ACCESS_TOKEN:
+        ACCESS_TOKEN = os.getenv('LISTOK_ACCESS_TOKEN')
     
-    # 1. Пробуем найти по телефону
-    search_url = f"{LISTOK_URL}/api/external/v2/contacts"
-    try:
-        resp = requests.get(
-            search_url, 
-            headers=HEADERS, 
-            params={'phone': phone}, 
-            timeout=10
-        )
-        print(f"📋 Ответ поиска: {resp.status_code}")
+    return {
+        'Authorization': f'Bearer {ACCESS_TOKEN}',
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest'
+    }
+
+# --- 1. ЛОГИКА OAUTH2 АВТОРИЗАЦИИ ---
+
+@app.route('/auth')
+def auth_start():
+    """Шаг 1: Перенаправляем пользователя на страницу входа ListOk"""
+    if not CLIENT_ID:
+        return "Ошибка: Не указан CLIENT_ID в .env", 500
         
-        if resp.status_code == 200:
-            data = resp.json()
-            contacts = data.get('data', [])
-            if contacts:
-                contact_id = contacts[0].get('contact_id')
-                print(f"✅ Контакт найден: {contact_id}")
-                return contact_id
-    except Exception as e:
-        print(f"⚠️ Ошибка поиска: {e}")
-    
-    # 2. Если не нашли — создаём
+    auth_url = (
+        f"{LISTOK_BASE_URL}/oauth/authorize"
+        f"?client_id={CLIENT_ID}"
+        f"&redirect_uri={REDIRECT_URI}"
+        f"&response_type=code"
+    )
+    return redirect(auth_url)
+
+@app.route('/callback')
+def auth_callback():
+    """Шаг 2: Получаем код, обмениваем на токен и сохраняем в .env"""
+    code = request.args.get('code')
+    if not code:
+        return "Ошибка авторизации: Нет кода", 400
+
     try:
-        print(f"➕ Создание нового контакта: {name}, {phone}")
-        resp = requests.post(
-            search_url, 
-            headers=HEADERS, 
-            json={
-                'name': name or 'Клиент из WhatsApp',
-                'phone': phone.lstrip('+'),
-                'email': email
-            }, 
-            timeout=10
-        )
-        print(f"📝 Ответ создания: {resp.status_code}")
+        # Запрос на обмен кода на токен
+        token_url = f"{LISTOK_BASE_URL}/oauth/token"
+        payload = {
+            'grant_type': 'authorization_code',
+            'client_id': CLIENT_ID,
+            'client_secret': CLIENT_SECRET,
+            'redirect_uri': REDIRECT_URI,
+            'code': code
+        }
         
-        if resp.status_code in [200, 201]:
-            data = resp.json()
-            contact_id = data.get('contact_id')
-            print(f"🆕 Контакт создан: {contact_id}")
-            return contact_id
+        # ListOk требует заголовок X-Requested-With даже для получения токена
+        headers = {'X-Requested-With': 'XMLHttpRequest'}
+        
+        resp = requests.post(token_url, json=payload, headers=headers)
+        resp.raise_for_status()
+        token_data = resp.json()
+        
+        # Сохраняем токен
+        global ACCESS_TOKEN
+        ACCESS_TOKEN = token_data.get('access_token')
+        
+        # Обновляем файл .env, чтобы токен сохранился навсегда
+        if ACCESS_TOKEN:
+            set_key('.env', 'LISTOK_ACCESS_TOKEN', ACCESS_TOKEN)
+            return f"<h1>Успешно!</h1><p>Токен получен и сохранен в .env. Теперь перезапусти сервер (Ctrl+C -> python app.py) и интеграция заработает.</p>"
         else:
-            print(f"❌ Ошибка создания: {resp.text}")
-    except Exception as e:
-        print(f"❌ Ошибка создания контакта: {e}")
-    
-    return None
+            return "Ошибка: Токен не пришел", 500
 
-def create_inquiry(contact_id, note=""):
-    """Создаём заявку"""
-    url = f"{LISTOK_URL}/api/external/v2/inquiry"
-    print(f"📤 Создание заявки для контакта {contact_id}")
-    
-    try:
-        resp = requests.post(
-            url, 
-            headers=HEADERS, 
-            json={
-                'cform_id': int(CFORM_ID),
-                'contact_id': contact_id,
-                'note': note,
-                'source': 'whatsapp'
-            }, 
-            timeout=10
-        )
-        print(f"📥 Ответ заявки: {resp.status_code} - {resp.text}")
-        return resp.status_code in [200, 201]
     except Exception as e:
-        print(f"❌ Ошибка создания заявки: {e}")
-        return False
+        return f"Ошибка обмена кода на токен: {str(e)}", 500
 
-@app.route('/webhook/vk', methods=['POST'])
-def vk_webhook():
-    """Вебхук для VK Ads"""
-    try:
-        data = request.json
-        print("📥 Получены данные от VK:", data)
-        
-        fields = data.get('fields', {})
-        phone = fields.get('phone', '')
-        name = fields.get('name', 'Не указано')
-        email = fields.get('email', '')
-        lead_id = data.get('lead_id', 'unknown')
-        
-        if not phone:
-            print("⚠️ Нет телефона, пропускаем")
-            return jsonify({'status': 'skipped'}), 200
-        
-        phone = normalize_phone(phone)
-        print(f"📱 Телефон: {phone}")
-        
-        contact_id = find_or_create_contact(phone, name, email)
-        if not contact_id:
-            return jsonify({'error': 'contact_not_created'}), 500
-        
-        success = create_inquiry(contact_id, f"VK Lead #{lead_id}")
-        
-        if success:
-            return jsonify({'status': 'ok', 'contact_id': contact_id}), 200
-        else:
-            return jsonify({'error': 'inquiry_not_created'}), 500
-            
-    except Exception as e:
-        print(f"❌ Ошибка VK webhook: {e}")
-        return jsonify({'error': str(e)}), 500
+# --- 2. ЛОГИКА ИНТЕГРАЦИИ (WAPPI -> LISTOK) ---
 
 @app.route('/webhook/wappi', methods=['POST'])
 def wappi_webhook():
-    """Вебхук для Wappi (WhatsApp)"""
+    """Принимает сообщения от Wappi"""
+    if not ACCESS_TOKEN:
+        return jsonify({'error': 'Token not set. Please authorize via /auth'}), 401
+
     try:
         data = request.json
         print("📱 Wappi webhook received")
         
-        # Wappi присылает массив messages
         messages = data.get('messages', [])
         if not messages:
-            print("⚠️ Нет сообщений в webhook")
             return '', 200
             
-        msg = messages[0]  # Берём первое сообщение
+        msg = messages[0]
         
-        # Проверяем тип сообщения (только входящие)
+        # Только входящие сообщения
         msg_type = msg.get('wh_type', '') or msg.get('type', '')
         if msg_type not in ['incoming_message', 'incoming']:
-            print(f"⚠️ Пропускаем сообщение типа: {msg_type}")
             return '', 200
         
-        # Извлекаем телефон (убираем @c.us)
+        # Извлекаем данные
         sender = msg.get('from', '') or msg.get('senderId', '')
         phone = sender.split('@')[0] if '@' in sender else sender
+        text = msg.get('body', '') or msg.get('textMessage', '')
+        sender_name = msg.get('senderName', '') or 'Клиент'
         
-        # Извлекаем текст сообщения
-        text = msg.get('body', '') or msg.get('textMessage', '') or msg.get('textMessageData', {}).get('textMessage', '')
+        print(f"📞 Phone: {phone}, Text: {text}")
         
-        # Извлекаем имя отправителя
-        sender_name = msg.get('senderName', '') or msg.get('pushName', '') or 'Клиент из WhatsApp'
-        
-        print(f"📞 Phone: {phone}, Name: {sender_name}, Text: {text}")
-        
-        if not phone or phone == '0':
-            print("⚠️ Неверный телефон")
-            return '', 200
+        if not phone: return '', 200
 
-        # Нормализуем телефон
-        phone = normalize_phone(phone)
+        # 1. Ищем контакт в ListOk
+        contact_id = find_contact(phone)
         
-        # Ищем или создаем контакт
-        contact_id = find_or_create_contact(phone, sender_name)
+        # 2. Если нет, создаем
+        if not contact_id:
+            contact_id = create_contact(phone, sender_name)
         
+        # 3. Создаем заявку
         if contact_id:
-            # Создаем заявку с текстом сообщения
-            success = create_inquiry(contact_id, f"WhatsApp: {text}")
-            print(f"✅ Заявка создана: {success}")
-        else:
-            print("❌ Не удалось создать контакт")
+            create_inquiry(contact_id, f"WhatsApp: {text}")
             
         return '', 200
         
     except Exception as e:
-        print(f"❌ Error in wappi webhook: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f" Error: {e}")
         return '', 500
 
 @app.route('/', methods=['GET'])
 def index():
-    """Главная страница"""
-    return jsonify({
-        'status': 'VK-ListOk-Wappi integration is running!',
-        'endpoints': {
-            'vk_webhook': '/webhook/vk',
-            'wappi_webhook': '/webhook/wappi'
-        }
-    }), 200
+    """Проверка статуса"""
+    if not ACCESS_TOKEN:
+        return jsonify({
+            'status': 'Auth required',
+            'action': f'Go to <a href="/auth">/auth</a> to connect ListOk'
+        })
+    return jsonify({'status': 'Running', 'token': 'Active'})
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+
+def normalize_phone(phone):
+    digits = re.sub(r'\D', '', phone)
+    if len(digits) == 11 and digits.startswith('8'): digits = '7' + digits[1:]
+    return digits
+
+def find_contact(phone):
+    """Ищет контакт по телефону"""
+    url = f"{LISTOK_BASE_URL}/api/external/v2/contacts"
+    try:
+        resp = requests.get(url, headers=get_headers(), params={'phone': normalize_phone(phone)})
+        if resp.status_code == 200:
+            contacts = resp.json().get('data', [])
+            return contacts[0]['contact_id'] if contacts else None
+    except: return None
+
+def create_contact(phone, name):
+    """Создает контакт"""
+    url = f"{LISTOK_BASE_URL}/api/external/v2/contacts"
+    try:
+        resp = requests.post(url, headers=get_headers(), json={
+            'name': name,
+            'phone': normalize_phone(phone)
+        })
+        if resp.status_code in [200, 201]:
+            return resp.json().get('contact_id')
+    except Exception as e:
+        print(f"Create contact error: {e}")
+    return None
+
+def create_inquiry(contact_id, note):
+    """Создает заявку"""
+    url = f"{LISTOK_BASE_URL}/api/external/v2/inquiry"
+    try:
+        # Получаем список форм, чтобы взять первую cform_id (обычно 1)
+        # Но лучше использовать дефолтный, если не знаем ID формы
+        resp = requests.post(url, headers=get_headers(), json={
+            'cform_id': 1, # Поменяй на ID твоей формы захвата, если нужно
+            'contact_id': contact_id,
+            'note': note,
+            'source': 'whatsapp'
+        })
+        print(f"Create inquiry: {resp.status_code}")
+        return True
+    except Exception as e:
+        print(f"Create inquiry error: {e}")
+    return False
 
 if __name__ == '__main__':
-    print("🚀 Запуск сервера интеграции...")
-    print(f"📍 ListOk URL: {LISTOK_URL}")
-    print(f"🔑 Token: {'***' + API_TOKEN[-5:] if API_TOKEN else 'NOT SET'}")
     app.run(host='0.0.0.0', port=5000, debug=True)
